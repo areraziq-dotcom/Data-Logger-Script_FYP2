@@ -1,0 +1,246 @@
+31 October logger script update
+
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+PV single-module logger (INA226 + WCS1800 + ADS1115 + DS18B20)
+Tested on Raspberry Pi 3B+
+
+Changes vs your 24 OCT 2025 draft:
+- FIX: ADS1115 volts/bit uses Full-Scale from GAIN (not VCC)
+- FIX: WCS1800 sensitivity assumed at 3.3 V (≈0.040 V/A)
+- ADD: N_TURNS factor if you loop the conductor through WCS
+- Minor prints and robustness; same CSV schema
+"""
+
+import time, csv, os, sys, subprocess
+from datetime import datetime, timedelta
+import pytz  # pip install pytz
+
+# === External libs ===
+from ina226 import INA226
+from w1thermsensor import W1ThermSensor
+
+try:
+    import Adafruit_ADS1x15
+except ImportError:
+    Adafruit_ADS1x15 = None
+    print("⚠ ADS1115 library not found. Install with: sudo pip install adafruit-ads1x15")
+
+# =========================
+# ===== USER SETTINGS =====
+# =========================
+LOG_INTERVAL = 10 * 60        # seconds between logs (10 minutes)
+DATA_DIR     = "/home/areraziq/FYP2"
+
+# ADS1115 setup
+ADS_ADDR     = 0x48
+ADS_CHANNEL  = 0              # 0..3
+GAIN         = 2              # ADS1115 gain: 2 -> ±2.048 V (recommended)
+SAMPLES_AVG  = 4              # average this many readings for less noise
+
+# WCS1800 current sensor setup
+WCS_VCC              = 3.3    # how you power the WCS1800
+WCS_K_5V             = 0.060  # V/A at 5 V from typical datasheet
+SENSITIVITY          = WCS_K_5V * (WCS_VCC / 5.0)  # ≈0.040 V/A at 3.3 V
+N_TURNS              = 1      # number of passes through the sensor aperture
+WCS_POLARITY         = +1     # set to -1 if your current sign is inverted
+OFFSET_SAMPLES       = 50     # zero-offset calibration samples at start
+
+# Logger timezone
+TIMEZONE = pytz.timezone("Asia/Kuala_Lumpur")
+
+# =========================
+# ===== Helper funcs  =====
+# =========================
+def fs_from_gain(g):
+    """Return ADS1115 full-scale voltage (±FS) for a given GAIN."""
+    if g == 2/3:  return 6.144
+    if g == 1:    return 4.096
+    if g == 2:    return 2.048
+    if g == 4:    return 1.024
+    if g == 8:    return 0.512
+    if g == 16:   return 0.256
+    raise ValueError(f"Unsupported ADS1115 gain: {g}")
+
+FS = fs_from_gain(GAIN)
+
+def wait_for_time_sync(timeout=600):
+    """Wait until 'timedatectl' reports NTP synchronized (max 'timeout' seconds)."""
+    print("⏳ Waiting for network time synchronization...")
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            synced = subprocess.check_output(
+                "timedatectl show -p NTPSynchronized --value", shell=True
+            ).decode().strip()
+            if synced == "yes":
+                print("✅ Time synchronized successfully.\n")
+                return True
+        except Exception:
+            pass
+        time.sleep(10)
+    print("⚠ Proceeding without confirmed time sync.\n")
+    return False
+
+# =========================
+# ===== Initializing  =====
+# =========================
+wait_for_time_sync()
+
+# INA226 (bus voltage)
+try:
+    ina = INA226(busnum=1, address=0x40)
+    ina.configure()
+    print("✅ INA226 ready.")
+except Exception as e:
+    print(f"⚠ INA226 init error: {e}")
+    ina = None
+
+# DS18B20 temperature
+try:
+    temp_sensor = W1ThermSensor()
+    print("✅ DS18B20 ready.")
+except Exception as e:
+    print(f"⚠ DS18B20 init error: {e}")
+    temp_sensor = None
+
+# ADS1115 (WCS1800 analog)
+adc = None
+zero_offset = 0.0  # volts at zero current (will be calibrated)
+
+try:
+    if Adafruit_ADS1x15:
+        adc = Adafruit_ADS1x15.ADS1115(address=ADS_ADDR, busnum=1)
+        print("✅ ADS1115 detected for WCS1800 current sensor.")
+        # Zero-current calibration
+        print("🧭 Calibrating zero-current offset... ensure NO current flows.")
+        readings = []
+        for _ in range(OFFSET_SAMPLES):
+            raw = adc.read_adc(ADS_CHANNEL, gain=GAIN)
+            vout = raw * FS / 32768.0
+            readings.append(vout)
+            time.sleep(0.05)
+        zero_offset = sum(readings) / len(readings)
+        print(f"⚙️ Zero-current voltage: {zero_offset:.4f} V (FS=±{FS:.3f} V)\n")
+except Exception as e:
+    print(f"⚠ ADS1115 init error: {e}")
+    adc = None
+
+# =========================
+# ===== CSV helpers   =====
+# =========================
+def get_csv_path(date=None):
+    if date is None:
+        date = datetime.now(TIMEZONE)
+    date_str = date.strftime("%Y-%m-%d")
+    return os.path.join(DATA_DIR, f"pv_data_{date_str}.csv")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def ensure_csv_header(path):
+    if not os.path.exists(path):
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Vdc_V", "Idc_A", "ModuleTemp_C", "Note"])
+            writer.writerow(["", "", "", "", "--- Logger started ---"])
+
+# =========================
+# ===== Read sensors  =====
+# =========================
+def read_vdc():
+    """Return bus voltage (V) from INA226, or None."""
+    if not ina:
+        return None
+    try:
+        return float(ina.voltage())
+    except Exception as e:
+        print("⚠ INA226 read error:", e)
+        return None
+
+def read_idc():
+    """Return DC current (A) from WCS1800 via ADS1115, or None."""
+    if not adc:
+        return None
+    try:
+        acc = 0.0
+        for _ in range(max(1, SAMPLES_AVG)):
+            raw = adc.read_adc(ADS_CHANNEL, gain=GAIN)
+            vout = raw * FS / 32768.0
+            acc += vout
+            time.sleep(0.005)
+        vout_avg = acc / max(1, SAMPLES_AVG)
+        # Convert volts to amps; correct for number of turns and polarity
+        idc_effective = (vout_avg - zero_offset) / SENSITIVITY
+        idc_real = (idc_effective / max(1, N_TURNS)) * WCS_POLARITY
+        return float(idc_real)
+    except Exception as e:
+        print("⚠ ADS1115/WCS1800 read error:", e)
+        return None
+
+def read_temp_c():
+    """Return module/ambient temperature in °C from DS18B20, or None."""
+    if not temp_sensor:
+        return None
+    try:
+        return float(temp_sensor.get_temperature())
+    except Exception as e:
+        print("⚠ DS18B20 read error:", e)
+        return None
+
+# =========================
+# ===== Logging loop  =====
+# =========================
+def log_data(note=""):
+    now = datetime.now(TIMEZONE)
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    csv_path = get_csv_path(now)
+    ensure_csv_header(csv_path)
+
+    vdc = read_vdc()
+    idc = read_idc()
+    temp_c = read_temp_c()
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            ts,
+            f"{vdc:.3f}" if vdc is not None else "",
+            f"{idc:.3f}" if idc is not None else "",
+            f"{temp_c:.2f}" if temp_c is not None else "",
+            note
+        ])
+
+    print(f"{ts} | Vdc={vdc if vdc is not None else '---'} V | "
+          f"Idc={idc if idc is not None else '---'} A | "
+          f"Temp={temp_c if temp_c is not None else '---'} °C {note}")
+
+# =========================
+# ========  Main  =========
+# =========================
+if "SYSTEMD_EXEC_PID" in os.environ:
+    log_data("--- Logger restarted after crash ---")
+
+print(f"📁 Logging data daily to: {DATA_DIR}")
+print(f"🔧 ADS GAIN=±{FS:.3f} V, WCS_K={SENSITIVITY*1000:.1f} mV/A @ {WCS_VCC:.1f} V, N_TURNS={N_TURNS}")
+print(f"⏳ Logging every {LOG_INTERVAL/60:.0f} minutes. Press Ctrl+C to stop.\n")
+
+try:
+    last_date = datetime.now(TIMEZONE).date()
+    while True:
+        current_date = datetime.now(TIMEZONE).date()
+        if current_date != last_date:
+            print(f"\n📅 Date changed → new CSV file for {current_date}\n")
+            last_date = current_date
+        log_data()
+        time.sleep(LOG_INTERVAL)
+except KeyboardInterrupt:
+    print("\n🟢 Logging stopped by user.")
+    log_data("--- Logger stopped by user ---")
+except Exception as e:
+    print(f"\n💥 Unexpected error: {e}")
+    log_data(f"--- Logger crashed: {e} ---")
+    raise
