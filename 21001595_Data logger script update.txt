@@ -1,5 +1,5 @@
-31 October logger script update
-
+#Wan Hafiy Arraziq (21001595)
+#FYP 2 Data Logger Code
 
 
 #!/usr/bin/env python3
@@ -244,3 +244,4 @@ except Exception as e:
     print(f"\n💥 Unexpected error: {e}")
     log_data(f"--- Logger crashed: {e} ---")
     raise
+
